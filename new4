@@ -2,25 +2,22 @@ from datetime import datetime, timedelta
 from airflow import DAG
 from airflow.decorators import task
 from airflow.models import DagRun
-from airflow.sensors.external_task import ExternalTaskSensor
 from airflow.operators.empty import EmptyOperator
 from airflow.utils.trigger_rule import TriggerRule
 from airflow.utils.session import provide_session
 from airflow.api.common.experimental.trigger_dag import trigger_dag
-import logging
-
+import logging, time
 
 # -----------------------------
-# Configs
+# Configurations
 # -----------------------------
 CONFIG_IDS = ["config_001", "config_002", "config_003"]
-MAIN_DAG_ID = "validation_job_dag"  # <-- child DAG to trigger
+MAIN_DAG_ID = "validation_job_dag"  # child DAG
 
 default_args = {
     "owner": "data-engineering",
     "depends_on_past": False,
     "start_date": datetime(2024, 1, 1),
-    "email_on_failure": True,
     "retries": 1,
     "retry_delay": timedelta(minutes=5),
 }
@@ -56,69 +53,72 @@ with DAG(
         logging.info(f"Triggered {MAIN_DAG_ID} for {config_id} with run_id={dr.run_id}")
         return {"config_id": config_id, "run_id": dr.run_id}
 
-    # 🔑 Mapping happens here (safe — on Python task, not operator)
     triggered_runs = trigger_main_dag.expand(config_id=CONFIG_IDS)
 
     # --------------------------
     # Step 2: Wait for each run
     # --------------------------
-    wait = ExternalTaskSensor.partial(
-        task_id="wait_validation",
-        external_dag_id=MAIN_DAG_ID,
-        external_task_id=None,        # wait for whole DAG
-        allowed_states=["success"],
-        failed_states=["failed"],
-        poke_interval=60,             # check every 1 min
-        timeout=7200,                 # 2h max wait
-        mode="reschedule",
-    ).expand(
-        external_run_id=triggered_runs.map(lambda x: x["run_id"])
-    )
+    @task
+    def wait_for_run(run_info: dict, poke_interval=60, timeout=7200):
+        """Poll Airflow metadata DB for a specific DAG run until it finishes."""
+        config_id = run_info["config_id"]
+        run_id = run_info["run_id"]
+        deadline = datetime.utcnow() + timedelta(seconds=timeout)
+
+        @provide_session
+        def get_state(session=None):
+            dr = (
+                session.query(DagRun)
+                .filter(DagRun.dag_id == MAIN_DAG_ID, DagRun.run_id == run_id)
+                .first()
+            )
+            return dr.state if dr else None
+
+        while datetime.utcnow() < deadline:
+            state = get_state()
+            if state in ["success", "failed"]:
+                logging.info(f"✅ Run {run_id} ({config_id}) finished with state={state}")
+                return {"config_id": config_id, "run_id": run_id, "state": state}
+
+            logging.info(f"⏳ Waiting for {config_id} / {run_id}, current state={state}")
+            time.sleep(poke_interval)
+
+        raise TimeoutError(f"⏰ Run {run_id} for {config_id} timed out")
+
+    monitored = wait_for_run.expand(run_info=triggered_runs)
 
     # --------------------------
     # Step 3: Summarize results
     # --------------------------
     @task(trigger_rule=TriggerRule.ALL_DONE)
-    def generate_summary(run_ids: list):
-        @provide_session
-        def get_state(dag_id, run_id, session=None):
-            dr = (
-                session.query(DagRun)
-                .filter(DagRun.dag_id == dag_id, DagRun.run_id == run_id)
-                .first()
-            )
-            return dr.state if dr else "not_found"
+    def summarize(results: list):
+        summary = {r["config_id"]: r["state"] for r in results}
+        total = len(results)
+        success = sum(1 for s in summary.values() if s == "success")
+        failed = sum(1 for s in summary.values() if s == "failed")
 
-        results = {r["config_id"]: get_state(MAIN_DAG_ID, r["run_id"]) for r in run_ids}
-
-        logging.info("📊 Validation Summary:")
-        for cfg, state in results.items():
+        logging.info(f"📊 Validation Summary: Total={total}, Success={success}, Failed={failed}")
+        for cfg, state in summary.items():
             logging.info(f" - {cfg}: {state}")
 
-        return {"total": len(run_ids), "results": results}
+        return {"total": total, "success": success, "failed": failed, "results": summary}
 
-    summary = generate_summary(triggered_runs)
+    summary = summarize(monitored)
 
     # --------------------------
     # Step 4: Notification
     # --------------------------
     @task(trigger_rule=TriggerRule.ALL_DONE)
     def send_notification(summary: dict):
-        total = summary["total"]
-        results = summary["results"]
-
-        success = sum(1 for s in results.values() if s == "success")
-        failed = sum(1 for s in results.values() if s == "failed")
-
-        emoji = "✅" if failed == 0 else "⚠️"
+        emoji = "✅" if summary["failed"] == 0 else "⚠️"
         msg = f"""
 {emoji} Controller DAG Report
 
-Total Configs: {total}
-✅ Success: {success}
-❌ Failed: {failed}
+Total Configs: {summary['total']}
+✅ Success: {summary['success']}
+❌ Failed: {summary['failed']}
 
-Details: {results}
+Details: {summary['results']}
 """
         logging.info(msg)
         return msg
@@ -130,4 +130,4 @@ Details: {results}
     # --------------------------
     # DAG Flow
     # --------------------------
-    start >> triggered_runs >> wait >> summary >> notify >> end
+    start >> triggered_runs >> monitored >> summary >> notify >> end
