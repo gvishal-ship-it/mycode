@@ -8,7 +8,7 @@ from airflow.utils.trigger_rule import TriggerRule
 import logging
 
 # ==============================
-# Configurations
+# Configurationssss
 # ==============================
 CONFIG_IDS = [
     "config_001",
@@ -16,7 +16,7 @@ CONFIG_IDS = [
     "config_003",
 ]
 
-MAIN_DAG_ID = "validation_job_dag"  # Replace with your actual DAG ID
+MAIN_DAG_ID = "validation_job_dag"  # The DAG to be triggered
 
 default_args = {
     "owner": "data-engineering",
@@ -48,10 +48,10 @@ with DAG(
     # ------------------------------
     trigger = TriggerDagRunOperator.partial(
         task_id="trigger_validation",
-        trigger_dag_id=MAIN_DAG_ID,
-        wait_for_completion=False,  # don’t block here
+        trigger_dag_id=MAIN_DAG_ID,   # fixed
+        wait_for_completion=False,
     ).expand(
-        conf=[{"config_id": cfg} for cfg in CONFIG_IDS]
+        conf=[{"config_id": cfg} for cfg in CONFIG_IDS]  # map over configs
     )
 
     # ------------------------------
@@ -73,41 +73,39 @@ with DAG(
     run_ids = extract_run_ids(trigger)
 
     # ------------------------------
-    # Step 3: Wait for specific runs
+    # Step 3: Wait for DAG completion
     # ------------------------------
     wait = ExternalTaskSensor.partial(
         task_id="wait_validation",
         external_dag_id=MAIN_DAG_ID,
-        external_task_id=None,         # wait for the whole DAG
+        external_task_id=None,         # wait for whole DAG
         allowed_states=["success"],
         failed_states=["failed"],
         poke_interval=60,              # check every 1 min
         timeout=7200,                  # 2h max wait
         mode="reschedule",
     ).expand(
-        external_task_id=[None] * len(CONFIG_IDS),
-        external_dag_id=[MAIN_DAG_ID] * len(CONFIG_IDS),
-        external_run_id=[r["run_id"] for r in run_ids]  # <-- critical part
+        external_run_id=[r["run_id"] for r in run_ids]  # tie to each run_id
     )
 
     # ------------------------------
-    # Step 4: Summary
+    # Step 4: Generate Summary
     # ------------------------------
     @task(trigger_rule=TriggerRule.ALL_DONE)
     def generate_summary(run_ids: list):
         """
         Summarize results of all config DAG runs.
         """
-        from airflow.utils.state import State
         from airflow.models import DagRun
         from airflow.utils.session import provide_session
 
         @provide_session
         def get_run_status(dag_id, run_id, session=None):
-            dr = session.query(DagRun).filter(
-                DagRun.dag_id == dag_id,
-                DagRun.run_id == run_id
-            ).first()
+            dr = (
+                session.query(DagRun)
+                .filter(DagRun.dag_id == dag_id, DagRun.run_id == run_id)
+                .first()
+            )
             return dr.state if dr else "not_found"
 
         results = {}
