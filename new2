@@ -1,0 +1,140 @@
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.decorators import task
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.operators.empty import EmptyOperator
+from airflow.utils.trigger_rule import TriggerRule
+import logging
+
+# ==============================
+# Configurations
+# ==============================
+CONFIG_IDS = [
+    "config_001",
+    "config_002",
+    "config_003",
+    "config_004",
+    "config_005",
+]
+
+MAIN_DAG_ID = "validation_job_dag"  # Replace with your actual DAG ID
+
+default_args = {
+    "owner": "data-engineering",
+    "depends_on_past": False,
+    "start_date": datetime(2024, 1, 1),
+    "email_on_failure": True,
+    "email_on_retry": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+# ==============================
+# Controller DAG
+# ==============================
+with DAG(
+    dag_id="controller_validation_dag",
+    default_args=default_args,
+    description="Controller DAG to run validation DAGs in parallel and summarize results",
+    schedule_interval=None,
+    catchup=False,
+    max_active_runs=1,
+    tags=["controller", "validation"],
+) as dag:
+
+    start = EmptyOperator(task_id="start")
+
+    # ==============================
+    # Step 1: Trigger main DAG for each config
+    # ==============================
+    trigger = TriggerDagRunOperator.partial(
+        task_id="trigger_validation",
+        trigger_dag_id=MAIN_DAG_ID,
+        wait_for_completion=False,
+    ).expand(
+        conf=[{"config_id": cfg} for cfg in CONFIG_IDS]
+    )
+
+    # ==============================
+    # Step 2: Wait for DAG completion for each config
+    # ==============================
+    wait = ExternalTaskSensor.partial(
+        task_id="wait_validation",
+        external_dag_id=MAIN_DAG_ID,
+        external_task_id=None,  # wait for whole DAG
+        allowed_states=["success"],
+        failed_states=["failed"],
+        poke_interval=60,   # check every 1 min
+        timeout=7200,       # 2 hours max wait
+        mode="reschedule",  # free worker slots
+    ).expand(
+        external_dag_id=[MAIN_DAG_ID] * len(CONFIG_IDS)
+    )
+
+    # ==============================
+    # Step 3: Generate summary
+    # ==============================
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def generate_summary(config_ids: list):
+        """
+        Generate summary after all configs are processed.
+        Note: ExternalTaskSensor will mark failed if the main DAG failed.
+        """
+        ti = kwargs["ti"]  # task instance
+        results = {}
+
+        for idx, cfg in enumerate(config_ids):
+            sensor_task_id = f"wait_validation__{idx}"  # mapped task naming
+            state = ti.xcom_pull(task_ids=sensor_task_id, key="return_value")
+            # Airflow sets sensor state automatically
+            task_state = ti.get_dagrun().get_task_instance(sensor_task_id).state
+            results[cfg] = task_state
+
+        success_count = sum(1 for v in results.values() if v == "success")
+        failed_count = sum(1 for v in results.values() if v == "failed")
+
+        summary = {
+            "total_configs": len(config_ids),
+            "success_count": success_count,
+            "failed_count": failed_count,
+            "results": results,
+        }
+
+        logging.info("📊 EXECUTION SUMMARY:")
+        logging.info(summary)
+
+        return summary
+
+    summary = generate_summary.override(task_id="generate_summary")(CONFIG_IDS)
+
+    # ==============================
+    # Step 4: Notification
+    # ==============================
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def send_notification(summary: dict):
+        """Send final notification with execution report"""
+        total = summary.get("total_configs", 0)
+        success = summary.get("success_count", 0)
+        failed = summary.get("failed_count", 0)
+
+        status_emoji = "✅" if failed == 0 else "⚠️"
+
+        message = f"""
+{status_emoji} Controller DAG Execution Report
+
+📊 Results Summary:
+• Total Configs: {total}
+• ✅ Successful: {success}
+• ❌ Failed: {failed}
+"""
+        logging.info(message)
+        # Extend: send Slack/Email/Teams here
+        return message
+
+    notification = send_notification(summary)
+
+    end = EmptyOperator(task_id="end", trigger_rule=TriggerRule.ALL_DONE)
+
+    # DAG Flow
+    start >> trigger >> wait >> summary >> notification >> end
