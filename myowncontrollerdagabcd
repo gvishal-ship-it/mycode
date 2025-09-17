@@ -1,0 +1,296 @@
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.operators.python import PythonOperator
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.utils.task_group import TaskGroup
+from airflow.models import DagRun
+from airflow.utils.state import DagRunState
+from airflow.utils.db import provide_session
+from airflow.operators.dummy import DummyOperator
+import logging
+from typing import Dict, List, Optional
+import time
+
+# Configuration - List of config IDs to process
+CONFIG_IDS = [
+    "config_001",
+    "config_002", 
+    "config_003",
+    "config_004",
+    "config_005"
+]
+
+# Main DAG ID that processes single config per run
+MAIN_DAG_ID = "validation_job_dag"  # Replace with your actual main DAG ID
+
+default_args = {
+    'owner': 'data-engineering',
+    'depends_on_past': False,
+    'start_date': datetime(2024, 1, 1),
+    'email_on_failure': True,
+    'email_on_retry': False,
+    'retries': 1,
+    'retry_delay': timedelta(minutes=5),
+}
+
+controller_dag = DAG(
+    'controller_parallel_validation_dag',
+    default_args=default_args,
+    description='Controller DAG to trigger validation jobs for multiple configs in parallel (one config per main DAG run)',
+    schedule_interval=None,  # Manually triggered
+    catchup=False,
+    max_active_runs=1,
+    tags=['controller', 'validation', 'parallel'],
+)
+
+def log_start_execution(**context):
+    """Log the start of parallel execution"""
+    logging.info("=" * 60)
+    logging.info("STARTING CONTROLLER DAG EXECUTION")
+    logging.info("=" * 60)
+    logging.info(f"Configs to process: {CONFIG_IDS}")
+    logging.info(f"Total number of configs: {len(CONFIG_IDS)}")
+    logging.info(f"Main DAG ID: {MAIN_DAG_ID}")
+    logging.info(f"Controller execution date: {context['ds']}")
+    logging.info("=" * 60)
+    
+    # Store execution info in XCom for later use
+    execution_info = {
+        'start_time': datetime.now().isoformat(),
+        'config_ids': CONFIG_IDS,
+        'total_configs': len(CONFIG_IDS)
+    }
+    return execution_info
+
+@provide_session
+def get_triggered_dag_run_status(config_id: str, controller_execution_date: str, session=None, **context):
+    """Check the status of the triggered DAG run for a specific config"""
+    
+    # Query for DAG runs that were triggered for this config
+    # We look for runs that have our config_id in their conf and were triggered around our execution time
+    dag_runs = session.query(DagRun).filter(
+        DagRun.dag_id == MAIN_DAG_ID,
+        DagRun.execution_date >= controller_execution_date
+    ).order_by(DagRun.execution_date.desc()).all()
+    
+    # Find the DAG run for this specific config
+    for dag_run in dag_runs:
+        if dag_run.conf and dag_run.conf.get('config_id') == config_id:
+            logging.info(f"Found DAG run for config {config_id}: {dag_run.dag_id}_{dag_run.execution_date}")
+            logging.info(f"DAG run state: {dag_run.state}")
+            return {
+                'config_id': config_id,
+                'dag_run_id': f"{dag_run.dag_id}_{dag_run.execution_date}",
+                'state': dag_run.state,
+                'start_date': str(dag_run.start_date) if dag_run.start_date else None,
+                'end_date': str(dag_run.end_date) if dag_run.end_date else None
+            }
+    
+    logging.warning(f"No DAG run found for config {config_id}")
+    return {'config_id': config_id, 'state': 'not_found'}
+
+def generate_final_summary(**context):
+    """Generate final execution summary"""
+    logging.info("=" * 60)
+    logging.info("GENERATING FINAL EXECUTION SUMMARY")
+    logging.info("=" * 60)
+    
+    # Get start time from XCom
+    start_info = context['task_instance'].xcom_pull(task_ids='log_start_execution')
+    
+    summary = {
+        'controller_execution_date': context['ds'],
+        'controller_start_time': start_info.get('start_time') if start_info else None,
+        'controller_end_time': datetime.now().isoformat(),
+        'total_configs': len(CONFIG_IDS),
+        'configs_processed': CONFIG_IDS,
+        'main_dag_id': MAIN_DAG_ID
+    }
+    
+    # Get status for each config
+    config_statuses = {}
+    for config_id in CONFIG_IDS:
+        status = get_triggered_dag_run_status(config_id, context['ds'])
+        config_statuses[config_id] = status
+    
+    summary['config_statuses'] = config_statuses
+    
+    # Count successes and failures
+    success_count = sum(1 for status in config_statuses.values() if status.get('state') == DagRunState.SUCCESS)
+    failed_count = sum(1 for status in config_statuses.values() if status.get('state') == DagRunState.FAILED)
+    running_count = sum(1 for status in config_statuses.values() if status.get('state') == DagRunState.RUNNING)
+    
+    summary['success_count'] = success_count
+    summary['failed_count'] = failed_count
+    summary['running_count'] = running_count
+    
+    # Log summary
+    logging.info(f"Total Configs: {len(CONFIG_IDS)}")
+    logging.info(f"Successful: {success_count}")
+    logging.info(f"Failed: {failed_count}")
+    logging.info(f"Still Running: {running_count}")
+    logging.info("-" * 40)
+    
+    for config_id, status in config_statuses.items():
+        logging.info(f"Config {config_id}: {status.get('state', 'unknown')}")
+    
+    logging.info("=" * 60)
+    
+    if failed_count > 0:
+        failed_configs = [config_id for config_id, status in config_statuses.items() 
+                         if status.get('state') == DagRunState.FAILED]
+        logging.error(f"Failed configs: {failed_configs}")
+        # Uncomment the next line if you want the controller to fail when any config fails
+        # raise Exception(f"Some validation jobs failed: {failed_configs}")
+    
+    return summary
+
+# Create a custom sensor that can find the specific DAG run triggered for each config
+class ConfigSpecificExternalTaskSensor(ExternalTaskSensor):
+    """Custom sensor that can identify the specific DAG run for a config"""
+    
+    def __init__(self, config_id: str, *args, **kwargs):
+        self.config_id = config_id
+        super().__init__(*args, **kwargs)
+    
+    @provide_session
+    def poke(self, context, session=None):
+        """Override poke to find the specific DAG run for our config"""
+        # Find DAG runs for the external DAG
+        dag_runs = session.query(DagRun).filter(
+            DagRun.dag_id == self.external_dag_id,
+            DagRun.execution_date >= context['execution_date']
+        ).order_by(DagRun.execution_date.desc()).all()
+        
+        # Find the run with our config_id
+        target_dag_run = None
+        for dag_run in dag_runs:
+            if dag_run.conf and dag_run.conf.get('config_id') == self.config_id:
+                target_dag_run = dag_run
+                break
+        
+        if not target_dag_run:
+            self.log.info(f"No DAG run found yet for config {self.config_id}")
+            return False
+        
+        self.log.info(f"Found DAG run for config {self.config_id}: {target_dag_run.dag_id}_{target_dag_run.execution_date}")
+        self.log.info(f"DAG run state: {target_dag_run.state}")
+        
+        if target_dag_run.state in self.allowed_states:
+            self.log.info(f"DAG run for config {self.config_id} completed successfully")
+            return True
+        elif target_dag_run.state in self.failed_states:
+            raise Exception(f"DAG run for config {self.config_id} failed with state: {target_dag_run.state}")
+        
+        return False
+
+# Start task
+start_task = PythonOperator(
+    task_id='log_start_execution',
+    python_callable=log_start_execution,
+    dag=controller_dag
+)
+
+# Create parallel task groups for each config
+parallel_groups = []
+
+for config_id in CONFIG_IDS:
+    with TaskGroup(
+        group_id=f'process_config_{config_id}',
+        tooltip=f'Process validation for config {config_id}',
+        dag=controller_dag
+    ) as config_group:
+        
+        # Task to trigger main DAG with specific config
+        trigger_validation = TriggerDagRunOperator(
+            task_id=f'trigger_validation_{config_id}',
+            trigger_dag_id=MAIN_DAG_ID,
+            conf={
+                "config_id": config_id,  # This matches your format: {"config_id":"sugdyage37647wgdkasbdk"}
+                "triggered_by_controller": True,
+                "controller_dag_id": controller_dag.dag_id,
+                "controller_execution_date": "{{ ds }}",
+                "controller_run_id": "{{ run_id }}"
+            },
+            wait_for_completion=False,  # Don't wait here, use sensor
+            poke_interval=30,
+            dag=controller_dag
+        )
+        
+        # Custom sensor to wait for the specific DAG run to complete
+        wait_for_validation = ConfigSpecificExternalTaskSensor(
+            config_id=config_id,
+            task_id=f'wait_for_validation_{config_id}',
+            external_dag_id=MAIN_DAG_ID,
+            external_task_id=None,  # Monitor entire DAG
+            timeout=7200,  # 2 hours timeout
+            poke_interval=60,  # Check every minute
+            mode='poke',
+            allowed_states=[DagRunState.SUCCESS],
+            failed_states=[DagRunState.FAILED, DagRunState.UPSTREAM_FAILED],
+            soft_fail=False,  # Set to True if you want controller to continue even if some configs fail
+            dag=controller_dag
+        )
+        
+        # Optional: Log completion for this config
+        def log_config_completion(config_id=config_id, **context):
+            logging.info(f"✅ Validation completed successfully for config: {config_id}")
+            return f"Completed: {config_id}"
+        
+        log_completion = PythonOperator(
+            task_id=f'log_completion_{config_id}',
+            python_callable=log_config_completion,
+            dag=controller_dag
+        )
+        
+        # Set dependencies within the task group
+        trigger_validation >> wait_for_validation >> log_completion
+        
+        parallel_groups.append(config_group)
+
+# Summary and completion tasks
+summary_task = PythonOperator(
+    task_id='generate_final_summary',
+    python_callable=generate_final_summary,
+    dag=controller_dag
+)
+
+# End marker
+end_task = DummyOperator(
+    task_id='controller_execution_complete',
+    dag=controller_dag
+)
+
+# Set overall DAG dependencies
+# All configs run in parallel, then summary, then end
+start_task >> parallel_groups >> summary_task >> end_task
+
+# Optional: Add notification task
+def send_notification(**context):
+    """Send notification about execution completion"""
+    summary = context['task_instance'].xcom_pull(task_ids='generate_final_summary')
+    
+    message = f"""
+🎯 Controller DAG Execution Completed
+
+📊 Summary:
+• Total Configs: {summary.get('total_configs', 0)}
+• Successful: {summary.get('success_count', 0)}
+• Failed: {summary.get('failed_count', 0)}
+• Execution Date: {summary.get('controller_execution_date', 'N/A')}
+
+Main DAG: {MAIN_DAG_ID}
+    """
+    
+    logging.info(message)
+    # Add your notification logic here (email, Slack, etc.)
+    return message
+
+# Uncomment to add notification
+# notification_task = PythonOperator(
+#     task_id='send_notification',
+#     python_callable=send_notification,
+#     dag=controller_dag
+# )
+# summary_task >> notification_task >> end_task
