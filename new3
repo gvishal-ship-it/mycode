@@ -1,0 +1,166 @@
+from datetime import datetime, timedelta
+from airflow import DAG
+from airflow.decorators import task
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.sensors.external_task import ExternalTaskSensor
+from airflow.operators.empty import EmptyOperator
+from airflow.utils.trigger_rule import TriggerRule
+import logging
+
+# ==============================
+# Configurations
+# ==============================
+CONFIG_IDS = [
+    "config_001",
+    "config_002",
+    "config_003",
+]
+
+MAIN_DAG_ID = "validation_job_dag"  # Replace with your actual DAG ID
+
+default_args = {
+    "owner": "data-engineering",
+    "depends_on_past": False,
+    "start_date": datetime(2024, 1, 1),
+    "email_on_failure": True,
+    "email_on_retry": False,
+    "retries": 1,
+    "retry_delay": timedelta(minutes=5),
+}
+
+# ==============================
+# Controller DAG
+# ==============================
+with DAG(
+    dag_id="controller_validation_dag",
+    default_args=default_args,
+    description="Controller DAG with run_id tracking",
+    schedule_interval=None,
+    catchup=False,
+    max_active_runs=1,
+    tags=["controller", "validation"],
+) as dag:
+
+    start = EmptyOperator(task_id="start")
+
+    # ------------------------------
+    # Step 1: Trigger main DAG runs
+    # ------------------------------
+    trigger = TriggerDagRunOperator.partial(
+        task_id="trigger_validation",
+        trigger_dag_id=MAIN_DAG_ID,
+        wait_for_completion=False,  # don’t block here
+    ).expand(
+        conf=[{"config_id": cfg} for cfg in CONFIG_IDS]
+    )
+
+    # ------------------------------
+    # Step 2: Extract run_ids
+    # ------------------------------
+    @task
+    def extract_run_ids(trigger_results: list):
+        """
+        Extract run_ids from TriggerDagRunOperator results.
+        Each trigger result includes {"run_id": "...", "dag_id": "..."}.
+        """
+        run_ids = []
+        for idx, result in enumerate(trigger_results):
+            if not result or "run_id" not in result:
+                raise ValueError(f"No run_id found for config {CONFIG_IDS[idx]}")
+            run_ids.append({"config_id": CONFIG_IDS[idx], "run_id": result["run_id"]})
+        return run_ids
+
+    run_ids = extract_run_ids(trigger)
+
+    # ------------------------------
+    # Step 3: Wait for specific runs
+    # ------------------------------
+    wait = ExternalTaskSensor.partial(
+        task_id="wait_validation",
+        external_dag_id=MAIN_DAG_ID,
+        external_task_id=None,         # wait for the whole DAG
+        allowed_states=["success"],
+        failed_states=["failed"],
+        poke_interval=60,              # check every 1 min
+        timeout=7200,                  # 2h max wait
+        mode="reschedule",
+    ).expand(
+        external_task_id=[None] * len(CONFIG_IDS),
+        external_dag_id=[MAIN_DAG_ID] * len(CONFIG_IDS),
+        external_run_id=[r["run_id"] for r in run_ids]  # <-- critical part
+    )
+
+    # ------------------------------
+    # Step 4: Summary
+    # ------------------------------
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def generate_summary(run_ids: list):
+        """
+        Summarize results of all config DAG runs.
+        """
+        from airflow.utils.state import State
+        from airflow.models import DagRun
+        from airflow.utils.session import provide_session
+
+        @provide_session
+        def get_run_status(dag_id, run_id, session=None):
+            dr = session.query(DagRun).filter(
+                DagRun.dag_id == dag_id,
+                DagRun.run_id == run_id
+            ).first()
+            return dr.state if dr else "not_found"
+
+        results = {}
+        for item in run_ids:
+            cfg = item["config_id"]
+            rid = item["run_id"]
+            state = get_run_status(MAIN_DAG_ID, rid)
+            results[cfg] = state
+
+        summary = {
+            "total_configs": len(run_ids),
+            "results": results,
+        }
+
+        logging.info("📊 Validation Summary:")
+        for cfg, state in results.items():
+            logging.info(f" - {cfg}: {state}")
+
+        return summary
+
+    summary = generate_summary(run_ids)
+
+    # ------------------------------
+    # Step 5: Notification
+    # ------------------------------
+    @task(trigger_rule=TriggerRule.ALL_DONE)
+    def send_notification(summary: dict):
+        total = summary["total_configs"]
+        results = summary["results"]
+
+        success = sum(1 for v in results.values() if v == "success")
+        failed = sum(1 for v in results.values() if v == "failed")
+
+        status_emoji = "✅" if failed == 0 else "⚠️"
+
+        message = f"""
+{status_emoji} Controller DAG Report
+
+📊 Results:
+• Total Configs: {total}
+• ✅ Successful: {success}
+• ❌ Failed: {failed}
+
+Details:
+{results}
+"""
+        logging.info(message)
+        # Extend: send Slack/Email/etc
+        return message
+
+    notification = send_notification(summary)
+
+    end = EmptyOperator(task_id="end", trigger_rule=TriggerRule.ALL_DONE)
+
+    # DAG Flow
+    start >> trigger >> run_ids >> wait >> summary >> notification >> end
