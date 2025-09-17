@@ -8,7 +8,7 @@ from airflow.utils.trigger_rule import TriggerRule
 import logging
 
 # ==============================
-# Configurationssss
+# Configurationnnnns
 # ==============================
 CONFIG_IDS = [
     "config_001",
